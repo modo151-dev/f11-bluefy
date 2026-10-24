@@ -13,7 +13,7 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
 </head>
 <body>
 <h1>📱 F11 ⇄ iPhone</h1>
-<div class="sub">Bluetooth Direct • Bluefy • v1.0 — تجربة اتصال ونقل صوت بين الجهازين</div>
+<div class="sub">Bluetooth Direct • Bluefy • v1.1 — تجربة اتصال ونقل صوت بين الجهازين</div>
 <div class="panel">
  <div class="status"><span class="dot" id="dot"></span><span id="state">غير متصل</span></div>
  <p>على الـOPPO افتح <b>F11 Bluetooth Host</b> واضغط <b>Start Bluetooth Host</b>. لازم يظهر <b>BLE advertising active</b>.</p>
@@ -35,7 +35,12 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
 <div class="panel">
  <h2>تجربة الصوت — iPhone → OPPO</h2>
  <p>من الـOPPO اضغط <b>Play iPhone mic on OPPO</b>، وبعدها هنا اضغط Start Mic. خليك بعيد عن سماعة الجهاز التاني لتجنب الصفير.</p>
- <div class="row"><button id="startMic" disabled>4. Start iPhone Mic</button><button id="stopMic" class="alt" disabled>Stop Mic</button></div>
+ <div class="row"><button id="beepToOppo" class="warn" disabled>4. Send Test Beep → OPPO</button></div>
+ <p>ابدأ بالصفارة دي للتأكد إن الـOPPO بيستقبل صوت Bluetooth، من غير استخدام ميكروفون الآيفون.</p>
+ <div class="row"><button id="startMic" disabled>5. Start iPhone Mic</button><button id="stopMic" class="alt" disabled>Stop Mic</button></div>
+ <p id="micState" class="small">iPhone microphone: not started</p>
+ <div class="stat"><span>مستوى الميكروفون (RMS)</span><strong id="micLevel">—</strong></div>
+ <div class="stat"><span>Packets dropped while sending</span><strong id="dropCount">0</strong></div>
  <div class="stat"><span>Bluetooth audio packets sent</span><strong id="sent">0</strong></div>
 </div>
 <p class="note">دي تجربة صوت Bluetooth بين الموبايلين فقط، <b>مش لسه صوت المكالمة الخلوية</b>. صفحة Bluefy محتاجة HTTPS للتحميل، لكن الصوت بيتنقل مباشرة عبر Bluetooth؛ مفيش سيرفر بياخد الصوت. خلي التطبيقين في الواجهة أثناء التجربة.</p>
@@ -45,9 +50,9 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
 const U={service:'d4f00001-7e12-4b98-a1ae-f11c00000001',control:'d4f00002-7e12-4b98-a1ae-f11c00000001',status:'d4f00003-7e12-4b98-a1ae-f11c00000001',hostAudio:'d4f00004-7e12-4b98-a1ae-f11c00000001',clientAudio:'d4f00005-7e12-4b98-a1ae-f11c00000001'};
 const $=id=>document.getElementById(id);
 let device=null,chars={},connected=false,ctx=null,playHead=0,rx=0,tx=0,pingAt=0,pingToken='',seq=0;
-let micStream=null,micSrc=null,micProcessor=null,micSilent=null,pcmPending=[],micQueue=[],micBusy=false,micOn=false,micDropped=0;
+let micStream=null,micSrc=null,micProcessor=null,micSilent=null,pcmPending=[],micQueue=[],micBusy=false,micOn=false,micDropped=0,beepBusy=false;
 function log(s){let x=$('log'); x.textContent+=`[${new Date().toLocaleTimeString()}] ${s}\n`;x.scrollTop=x.scrollHeight;}
-function ui(){['disconnect','hello','ping','speaker','startMic'].forEach(id=>$(id).disabled=!connected);$('connect').disabled=connected;$('clearAudio').disabled=!ctx;$('stopMic').disabled=!micOn;$('dot').classList.toggle('ok',connected);$('state').textContent=connected?'Bluetooth Connected':'غير متصل';$('recv').textContent=rx;$('sent').textContent=tx;}
+function ui(){['disconnect','hello','ping','speaker','startMic'].forEach(id=>$(id).disabled=!connected);$('connect').disabled=connected;$('clearAudio').disabled=!ctx;$('stopMic').disabled=!micOn;$('beepToOppo').disabled=!connected||beepBusy;$('startMic').disabled=!connected||beepBusy||micOn;$('dropCount').textContent=micDropped;$('dot').classList.toggle('ok',connected);$('state').textContent=connected?'Bluetooth Connected':'غير متصل';$('recv').textContent=rx;$('sent').textContent=tx;}
 function err(e){log('ERROR '+(e?.name||'')+': '+(e?.message||String(e)));}
 function disconnected(){connected=false;chars={};stopMic();$('device').textContent='اتقطع الاتصال';ui();log('Bluetooth disconnected');}
 async function connect(){try{if(!navigator.bluetooth){log('Web Bluetooth مش متاح هنا. افتح الصفحة في Bluefy، مش Safari.');return;}
@@ -74,27 +79,55 @@ async function enableSpeaker(){try{if(!ctx)ctx=new (window.AudioContext||window.
 function onAudio(ev){const v=ev.target.value;if(!v||v.byteLength<2)return;rx++;ui();if(!ctx||ctx.state!=='running')return;const bytes=new Uint8Array(v.buffer,v.byteOffset,v.byteLength);const len=bytes.length-1;try{const buffer=ctx.createBuffer(1,len,8000);const samples=buffer.getChannelData(0);for(let i=0;i<len;i++)samples[i]=decode(bytes[i+1]);const now=ctx.currentTime;if(playHead<now+0.03||playHead>now+0.8)playHead=now+0.065;const src=ctx.createBufferSource();src.buffer=buffer;src.connect(ctx.destination);src.start(playHead);playHead+=len/8000;}catch(e){err(e);}}
 async function stopSpeaker(){stopMic();if(ctx){try{await ctx.close();}catch(e){}ctx=null;}playHead=0;ui();log('Speaker stopped');}
 function onMicAudio(ev){if(!micOn)return;const arr=ev.inputBuffer.getChannelData(0);const native=ev.inputBuffer.sampleRate||ctx.sampleRate; // downsample by nearest-neighbor; BLE link test only
+let sum=0; for(let i=0;i<arr.length;i++)sum+=arr[i]*arr[i];const rms=Math.sqrt(sum/Math.max(1,arr.length));$('micLevel').textContent=rms.toFixed(4);
 if(!onMicAudio.acc)onMicAudio.acc=0;
 for(let i=0;i<arr.length;i++){onMicAudio.acc+=8000;if(onMicAudio.acc>=native){onMicAudio.acc-=native;pcmPending.push(encode(arr[i]));if(pcmPending.length===80){let pkt=new Uint8Array(81);pkt[0]=seq++&255;pkt.set(pcmPending,1);pcmPending=[];if(micQueue.length<10)micQueue.push(pkt);else micDropped++;}}}
 flushMic();}
 async function flushMic(){if(micBusy||!micOn||!connected)return;micBusy=true;try{while(micOn&&connected&&micQueue.length){const frame=micQueue.shift();try{if(chars.clientAudio.writeValueWithoutResponse)await chars.clientAudio.writeValueWithoutResponse(frame);else await chars.clientAudio.writeValue(frame);tx++;if(tx%20===0)ui();}catch(e){err(e);micOn=false;break;}}}finally{micBusy=false;}}
-async function startMic(){if(!connected)return;try{if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){log('Bluefy version does not expose microphone getUserMedia; Ping and beep still work.');return;}
+
+async function sendBeepToOppo(){
+  if(!connected||beepBusy)return;
+  stopMic();beepBusy=true;ui();
+  let ok=0;
+  log('Starting OPPO-directed BLE tone (no microphone needed). On OPPO enable Play iPhone mic on OPPO FIRST.');
+  try{
+    for(let frame=0;frame<150&&connected;frame++){
+      const pkt=new Uint8Array(81);pkt[0]=seq++&255;
+      for(let i=0;i<80;i++){
+        const index=frame*80+i;
+        const t=index/8000;
+        // Two short 700Hz beeps, separated by quiet, over ~1.5s
+        const on=(t>=0.15&&t<0.50)||(t>=0.78&&t<1.13);
+        pkt[i+1]=encode(on?Math.sin(2*Math.PI*700*t)*0.32:0);
+      }
+      if(chars.clientAudio.writeValueWithoutResponse)await chars.clientAudio.writeValueWithoutResponse(pkt);
+      else await chars.clientAudio.writeValue(pkt);
+      ok++;tx++;if(frame%10===0)ui();
+      await new Promise(resolve=>setTimeout(resolve,12));
+    }
+    log('iPhone -> OPPO TEST BEEP finished. BLE packets written='+ok+'. On OPPO toggle playback OFF to see Received packets.');
+  }catch(e){log('iPhone -> OPPO TEST BEEP FAILED after '+ok+' packets');err(e);}
+  finally{beepBusy=false;ui();}
+}
+
+async function startMic(){if(!connected||beepBusy)return;try{$('micState').textContent='Requesting microphone...';log('Microphone API available: '+Boolean(navigator.mediaDevices?.getUserMedia));if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){log('Bluefy version does not expose microphone getUserMedia; Ping and beep still work.');$('micState').textContent='ERROR: Bluefy has no getUserMedia support';return;}
 await enableSpeaker();micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
-micSrc=ctx.createMediaStreamSource(micStream);micProcessor=ctx.createScriptProcessor(1024,1,1);micSilent=ctx.createGain();micSilent.gain.value=0;micSrc.connect(micProcessor);micProcessor.connect(micSilent);micSilent.connect(ctx.destination);micOn=true;pcmPending=[];micQueue=[];onMicAudio.acc=0;micProcessor.onaudioprocess=onMicAudio;log('iPhone mic started; tap Play iPhone mic on OPPO.');ui();
-}catch(e){stopMic();err(e);}}
-function stopMic(){micOn=false;if(micProcessor){micProcessor.onaudioprocess=null;micProcessor.disconnect();micProcessor=null;}if(micSrc){micSrc.disconnect();micSrc=null;}if(micSilent){micSilent.disconnect();micSilent=null;}if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}pcmPending=[];micQueue=[];ui();}
+log('Microphone permission granted; track='+micStream.getAudioTracks().map(t=>t.readyState).join(','));await ctx.resume();micSrc=ctx.createMediaStreamSource(micStream);micProcessor=ctx.createScriptProcessor(1024,1,1);micSilent=ctx.createGain();micSilent.gain.value=0;micSrc.connect(micProcessor);micProcessor.connect(micSilent);micSilent.connect(ctx.destination);micOn=true;pcmPending=[];micQueue=[];onMicAudio.acc=0;micProcessor.onaudioprocess=onMicAudio;$('micState').textContent='Mic ON; speak now. Watch RMS and packets sent.';log('iPhone mic started; tap Play iPhone mic on OPPO.');ui();
+}catch(e){stopMic();$('micState').textContent='ERROR: '+(e?.name||'')+' '+(e?.message||'');err(e);}}
+function stopMic(){micOn=false;if($('micState'))$('micState').textContent='Mic OFF';if(micProcessor){micProcessor.onaudioprocess=null;micProcessor.disconnect();micProcessor=null;}if(micSrc){micSrc.disconnect();micSrc=null;}if(micSilent){micSilent.disconnect();micSilent=null;}if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}pcmPending=[];micQueue=[];ui();}
 $('connect').addEventListener('click',connect);
 $('disconnect').addEventListener('click',()=>{if(device?.gatt?.connected)device.gatt.disconnect();disconnected();});
 $('hello').addEventListener('click',()=>send('HELLO'));
 $('ping').addEventListener('click',()=>{pingToken=String(Date.now());pingAt=performance.now();send('PING:'+pingToken);});
 $('speaker').addEventListener('click',enableSpeaker);
+$('beepToOppo').addEventListener('click',sendBeepToOppo);
 $('clearAudio').addEventListener('click',stopSpeaker);
 $('startMic').addEventListener('click',startMic);
 $('stopMic').addEventListener('click',()=>{stopMic();log('Mic stopped.');});
 $('copy').addEventListener('click',async()=>{try{await navigator.clipboard.writeText($('log').textContent);log('Log copied');}catch(e){err(e);}});
 $('clear').addEventListener('click',()=>{$('log').textContent='';});
 window.addEventListener('pagehide',()=>{stopMic();});
-log('Open in Bluefy over HTTPS. No cloud audio relay.');ui();
+log('Bluefy v1.1 diagnostics ready. No cloud audio relay.');ui();
 </script>
 </body>
 </html>
