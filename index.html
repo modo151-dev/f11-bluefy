@@ -13,7 +13,7 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
 </head>
 <body>
 <h1>📱 F11 ⇄ iPhone</h1>
-<div class="sub">Bluetooth Direct • Bluefy • v1.4 — Bluetooth Voice Quality Test</div>
+<div class="sub">Bluetooth Direct • Bluefy • v1.5 — Continuous Audio Engine</div>
 <div class="panel">
  <div class="status"><span class="dot" id="dot"></span><span id="state">غير متصل</span></div>
  <p>على الـOPPO افتح <b>F11 Bluetooth Host</b> واضغط <b>Start Bluetooth Host</b>. لازم يظهر <b>BLE advertising active</b>.</p>
@@ -33,6 +33,10 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
  <div class="stat"><span>Bluetooth audio packets received</span><strong id="recv">0</strong></div>
  <div class="stat"><span>RX missing packets (sequence gaps)</span><strong id="rxGaps">0</strong></div>
  <div class="stat"><span>iPhone speaker underruns</span><strong id="rxUnderruns">0</strong></div>
+ <div class="stat"><span>Speaker buffer (ms)</span><strong id="speakerBuffer">0</strong></div>
+ <div class="stat"><span>Speaker overflows</span><strong id="speakerOverflow">0</strong></div>
+ <div class="stat"><span>Playback engine</span><strong id="playbackMode">—</strong></div>
+ <div class="stat"><span>Android BLE statistics</span><strong id="hostStats">—</strong></div>
  <div class="stat"><span>Bluetooth frame duration</span><strong id="frameMs">10ms (waiting for config)</strong></div>
 </div>
 <div class="panel">
@@ -47,22 +51,23 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
  <div class="stat"><span>Bluetooth audio packets sent</span><strong id="sent">0</strong></div>
  <div class="stat"><span>Mic packets queued</span><strong id="micQueued">0</strong></div>
 </div>
-<p class="note">v1.4 اختبر الصوت العادي بين الجهازين أولًا بدون Cellular Bridge أو Frida. الميكروفون والسماعة على الجهازين متباعدين لمنع الصفير. صوت Bluetooth مباشر بلا وسيط Wi-Fi. ما تستخدموش في مكالمات خاصة، وخلي Bluefy وAndroid Host في الواجهة.</p>
+<p class="note">v1.5 اختبر الصوت العادي بين الجهازين أولًا بدون Cellular Bridge أو Frida. الميكروفون والسماعة على الجهازين متباعدين لمنع الصفير. صوت Bluetooth مباشر بلا وسيط Wi-Fi. ما تستخدموش في مكالمات خاصة، وخلي Bluefy وAndroid Host في الواجهة.</p>
 <div class="panel"><h2>Log</h2><pre id="log" aria-live="polite"></pre><div class="row"><button id="copy" class="alt">Copy Log</button><button id="clear" class="alt">Clear Log</button></div></div>
 <script>
 'use strict';
 const U={service:'d4f00001-7e12-4b98-a1ae-f11c00000001',control:'d4f00002-7e12-4b98-a1ae-f11c00000001',status:'d4f00003-7e12-4b98-a1ae-f11c00000001',hostAudio:'d4f00004-7e12-4b98-a1ae-f11c00000001',clientAudio:'d4f00005-7e12-4b98-a1ae-f11c00000001'};
 const $=id=>document.getElementById(id);
-let device=null,chars={},connected=false,ctx=null,playHead=0,rx=0,tx=0,pingAt=0,pingToken='',seq=0;
+let device=null,chars={},connected=false,ctx=null,rx=0,tx=0,pingAt=0,pingToken='',seq=0;
 let micStream=null,micSrc=null,micProcessor=null,micSilent=null,pcmPending=[],micQueue=[],micBusy=false,micOn=false,micDropped=0,beepBusy=false;
 let micTimer=null, micSum=0, micCount=0, micPhase=0, micDisplayAt=0;
-let rxUnderruns=0, rxSilences=0;
+let rxUnderruns=0, rxSilences=0, rxOverflow=0, playbackNode=null, playbackMode='not started', playbackBuffer=null;
+let audioHealthTimer=null, lastHostStats='—';
 let bleFrameSamples=80, rxLastSeq=null, rxSequenceGaps=0, uiLast=0;
 function updateAudioStats(){const now=performance.now();if(now-uiLast>250){uiLast=now;ui();}}
 function log(s){let x=$('log'); x.textContent+=`[${new Date().toLocaleTimeString()}] ${s}\n`;x.scrollTop=x.scrollHeight;}
-function ui(){['disconnect','hello','ping','speaker','startMic'].forEach(id=>$(id).disabled=!connected);$('connect').disabled=connected;$('clearAudio').disabled=!ctx;$('stopMic').disabled=!micOn;$('beepToOppo').disabled=!connected||beepBusy;$('startMic').disabled=!connected||beepBusy||micOn;$('dropCount').textContent=micDropped; $('micQueued').textContent=micQueue.length; $('rxUnderruns').textContent=rxUnderruns;$('dot').classList.toggle('ok',connected);$('state').textContent=connected?'Bluetooth Connected':'غير متصل';$('recv').textContent=rx;$('sent').textContent=tx;const gapEl=$('rxGaps');if(gapEl)gapEl.textContent=rxSequenceGaps;}
+function ui(){['disconnect','hello','ping','speaker','startMic'].forEach(id=>$(id).disabled=!connected);$('connect').disabled=connected;$('clearAudio').disabled=!ctx;$('stopMic').disabled=!micOn;$('beepToOppo').disabled=!connected||beepBusy;$('startMic').disabled=!connected||beepBusy||micOn;$('dropCount').textContent=micDropped; $('micQueued').textContent=micQueue.length; $('rxUnderruns').textContent=rxUnderruns;$('speakerOverflow').textContent=rxOverflow;$('playbackMode').textContent=playbackMode;$('hostStats').textContent=lastHostStats;$('dot').classList.toggle('ok',connected);$('state').textContent=connected?'Bluetooth Connected':'غير متصل';$('recv').textContent=rx;$('sent').textContent=tx;const gapEl=$('rxGaps');if(gapEl)gapEl.textContent=rxSequenceGaps;}
 function err(e){log('ERROR '+(e?.name||'')+': '+(e?.message||String(e)));}
-function disconnected(){connected=false;chars={};stopMic();$('device').textContent='اتقطع الاتصال';ui();log('Bluetooth disconnected');}
+function disconnected(){connected=false;chars={};stopMic();resetPlayback();$('device').textContent='اتقطع الاتصال';ui();log('Bluetooth disconnected');}
 async function connect(){try{if(!navigator.bluetooth){log('Web Bluetooth مش متاح هنا. افتح الصفحة في Bluefy، مش Safari.');return;}
 $('state').textContent='جاري البحث...';log('Searching for F11 service '+U.service);
 // Service-filtered chooser finds the OPPO regardless of advertised name.
@@ -80,40 +85,99 @@ await chars.hostAudio.startNotifications();
 connected=true;$('device').textContent=device.name||'F11 Bluetooth Host (unnamed)';log('Connected; subscribed STATUS + HOST_AUDIO');ui();await send('HELLO');await send('AUDIO_CONFIG');
 }catch(e){connected=false;ui();err(e);$('state').textContent='فشل الاتصال';}}
 async function send(s){if(!connected||!chars.control)return;try{const data=new TextEncoder().encode(s);if(chars.control.writeValueWithResponse)await chars.control.writeValueWithResponse(data);else await chars.control.writeValue(data);log('TX control: '+s);}catch(e){err(e);}}
-function onStatus(ev){let v=ev.target.value;const msg=new TextDecoder().decode(new Uint8Array(v.buffer,v.byteOffset,v.byteLength));$('reply').textContent=msg;log('RX control: '+msg);if(msg.startsWith('AUDIOFRAME:')){const n=Number(msg.slice(11));if(n===80||n===160){bleFrameSamples=n;if(micOn)startMicTimer();const frameEl=$('frameMs');if(frameEl)frameEl.textContent=(n/8)+'ms';log('BLE voice packet duration='+(n/8)+'ms');}}if(msg==='PONG:'+pingToken){$('rtt').textContent=(performance.now()-pingAt).toFixed(0)+' ms';}}
+function onStatus(ev){let v=ev.target.value;const msg=new TextDecoder().decode(new Uint8Array(v.buffer,v.byteOffset,v.byteLength));$('reply').textContent=msg;log('RX control: '+msg);if(msg.startsWith('STATS:')){lastHostStats=msg.slice(6);updateAudioStats();return;}if(msg.startsWith('AUDIOFRAME:')){const n=Number(msg.slice(11));if(n===80||n===160){bleFrameSamples=n;if(micOn)startMicTimer();const frameEl=$('frameMs');if(frameEl)frameEl.textContent=(n/8)+'ms';log('BLE voice packet duration='+(n/8)+'ms');}}if(msg==='PONG:'+pingToken){$('rtt').textContent=(performance.now()-pingAt).toFixed(0)+' ms';}}
 function decode(b){const x=(~b)&255;const mag=((((x&15)<<3)+132)<<((x>>4)&7))-132;return ((x&128)?-mag:mag)/32768;}
 function encode(sample){let v=Math.max(-32768,Math.min(32767,Math.round(sample*32767)));const sign=v<0?128:0;if(v<0)v=-v;v=Math.min(v,32635)+132;let exponent=7,mask=0x4000;while(exponent>0&&(v&mask)===0){exponent--;mask>>=1;}const mantissa=(v>>(exponent+3))&15;return (~(sign|(exponent<<4)|mantissa))&255;}
-async function enableSpeaker(){try{if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});await ctx.resume();playHead=ctx.currentTime+0.18;log('iPhone audio unlocked. Now tap Send test beep on OPPO.');ui();}catch(e){err(e);}}
-function schedulePcmFrame(bytes, offset, len){
-  if(!ctx||ctx.state!=='running')return;
-  const now=ctx.currentTime;
-  if(playHead<now+0.025){playHead=now+0.18;rxUnderruns++;}
-  if(playHead>now+0.65){playHead=now+0.18;}
-  const buffer=ctx.createBuffer(1,len,8000);
-  const samples=buffer.getChannelData(0);
-  if(bytes) for(let i=0;i<len;i++)samples[i]=decode(bytes[offset+i]);
-  const source=ctx.createBufferSource();source.buffer=buffer;
-  source.connect(ctx.destination);source.start(playHead);
-  playHead+=len/8000;
+// A fixed-capacity ring buffer driven by the *audio clock*, not one AudioBufferSource per BLE packet.
+// Ring state is deliberately identical for AudioWorklet and the conservative Bluefy fallback.
+class F11JitterRing {
+  constructor(){this.data=new Float32Array(8192);this.read=0;this.write=0;this.size=0;this.frac=0;
+    this.active=false;this.underruns=0;this.overruns=0;this.prebuffer=800;this.maxBuffered=2400;}
+  reset(){this.read=0;this.write=0;this.size=0;this.frac=0;this.active=false;}
+  push(samples){for(let i=0;i<samples.length;i++){
+      if(this.size===this.data.length){this.read=(this.read+1)%this.data.length;this.size--;this.overruns++;}
+      this.data[this.write]=samples[i];this.write=(this.write+1)%this.data.length;this.size++;
+    }
+    if(this.size>this.maxBuffered){const discard=this.size-1200;
+      this.read=(this.read+discard)%this.data.length;this.size-=discard;this.overruns++;}}
+  render(output,outputRate){const ratio=8000/outputRate;
+    if(!this.active&&this.size>=this.prebuffer)this.active=true;
+    for(let i=0;i<output.length;i++){
+      if(!this.active){output[i]=0;continue;}
+      if(this.size<2){this.underruns++;this.active=false;this.frac=0;output.fill(0,i);break;}
+      const a=this.data[this.read],b=this.data[(this.read+1)%this.data.length];
+      output[i]=a+(b-a)*this.frac;this.frac+=ratio;
+      while(this.frac>=1&&this.size>0){this.frac-=1;this.read=(this.read+1)%this.data.length;this.size--;}
+    }
+  }
+}
+let fallbackJitter=null;
+async function setupPlayback(){
+  if(playbackNode)return;
+  if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+  await ctx.resume();
+  // AudioWorklet performs playback on the audio rendering thread, reducing timing jitter.
+  if(ctx.audioWorklet&&typeof window.AudioWorkletNode==='function'){
+    let blobURL=null;
+    try{
+      const workletCode='const F11JitterRing='+F11JitterRing.toString()+`;\n`+
+        `class F11Output extends AudioWorkletProcessor {
+          constructor(){super();this.ring=new F11JitterRing();this.ticks=0;
+            this.port.onmessage=e=>{if(e.data.type==='push')this.ring.push(e.data.samples);
+              else if(e.data.type==='reset')this.ring.reset();};}
+          process(inputs,outputs){const out=outputs[0];if(out&&out[0]){
+              this.ring.render(out[0],sampleRate);
+              for(let ch=1;ch<out.length;ch++)out[ch].set(out[0]);}
+            if(++this.ticks%125===0)this.port.postMessage({type:'stats',buffer:this.ring.size,
+              underruns:this.ring.underruns,overruns:this.ring.overruns});
+            return true;}}
+          registerProcessor('f11-jitter-output',F11Output);`;
+      blobURL=URL.createObjectURL(new Blob([workletCode],{type:'text/javascript'}));
+      await ctx.audioWorklet.addModule(blobURL);
+      playbackNode=new AudioWorkletNode(ctx,'f11-jitter-output',{numberOfInputs:0,
+        numberOfOutputs:1,outputChannelCount:[1]});
+      playbackNode.port.onmessage=e=>{if(e.data.type==='stats'){
+        rxUnderruns=e.data.underruns;rxOverflow=e.data.overruns;
+        $('speakerBuffer').textContent=Math.round(e.data.buffer/8);updateAudioStats();}};
+      playbackNode.connect(ctx.destination);playbackMode='AudioWorklet';
+      log('Speaker: AudioWorklet continuous jitter buffer active.');
+    }catch(e){log('AudioWorklet unavailable; using ScriptProcessor fallback: '+(e?.message||e));
+      if(playbackNode){playbackNode.disconnect();playbackNode=null;}}
+    finally{if(blobURL)URL.revokeObjectURL(blobURL);}
+  }
+  if(!playbackNode){
+    fallbackJitter=new F11JitterRing();
+    playbackNode=ctx.createScriptProcessor(2048,0,1);
+    playbackNode.onaudioprocess=e=>{fallbackJitter.render(e.outputBuffer.getChannelData(0),ctx.sampleRate);
+      rxUnderruns=fallbackJitter.underruns;rxOverflow=fallbackJitter.overruns;
+      $('speakerBuffer').textContent=Math.round(fallbackJitter.size/8);};
+    playbackNode.connect(ctx.destination);playbackMode='ScriptProcessor fallback';
+    log('Speaker fallback: continuous jitter buffer (AudioWorklet not supported).');
+  }
+  ui();
+}
+async function enableSpeaker(){try{await setupPlayback();log('iPhone speaker ready. Start OPPO audio.');}catch(e){err(e);}}
+function resetPlayback(){if(playbackMode==='AudioWorklet'&&playbackNode)playbackNode.port.postMessage({type:'reset'});
+  if(fallbackJitter)fallbackJitter.reset();rxLastSeq=null;}
+function schedulePcmFrame(bytes,offset,len){if(!ctx||ctx.state!=='running'||!playbackNode)return;
+  const samples=new Float32Array(len);if(bytes)for(let i=0;i<len;i++)samples[i]=decode(bytes[offset+i]);
+  if(playbackMode==='AudioWorklet')playbackNode.port.postMessage({type:'push',samples},[samples.buffer]);
+  else if(fallbackJitter)fallbackJitter.push(samples);
 }
 function onAudio(ev){
   const v=ev.target.value;if(!v||v.byteLength<2)return;
-  const bytes=new Uint8Array(v.buffer,v.byteOffset,v.byteLength); const len=bytes.length-1;
+  const bytes=new Uint8Array(v.buffer,v.byteOffset,v.byteLength);const len=bytes.length-1;
   rx++;
-  const receivedSeq=bytes[0];
-  let gap=0;
-  if(rxLastSeq!==null){const diff=(receivedSeq-rxLastSeq+256)%256;if(diff>1&&diff<128){gap=diff-1;rxSequenceGaps+=gap;}}
-  rxLastSeq=receivedSeq;
-  updateAudioStats();
-  if(!ctx||ctx.state!=='running')return;
-  try{
-    // Replace a few lost frames with silence, preserving playback timing.
-    for(let n=0;n<Math.min(gap,5);n++){schedulePcmFrame(null,0,len);rxSilences++;}
-    if(gap>5)playHead=ctx.currentTime+0.18;
-    schedulePcmFrame(bytes,1,len);
+  const receivedSeq=bytes[0];let gap=0;
+  if(rxLastSeq!==null){const diff=(receivedSeq-rxLastSeq+256)%256;
+    if(diff>1&&diff<128){gap=diff-1;rxSequenceGaps+=gap;}}
+  rxLastSeq=receivedSeq;updateAudioStats();
+  if(!ctx||ctx.state!=='running'||!playbackNode)return;
+  try{for(let n=0;n<Math.min(gap,8);n++){schedulePcmFrame(null,0,len);rxSilences++;}
+    if(gap>8)resetPlayback();schedulePcmFrame(bytes,1,len);
   }catch(e){err(e);}
 }
-async function stopSpeaker(){stopMic();if(ctx){try{await ctx.close();}catch(e){}ctx=null;}playHead=0;ui();log('Speaker stopped');}
+async function stopSpeaker(){stopMic();if(playbackNode){try{playbackNode.disconnect();}catch(e){}playbackNode=null;}fallbackJitter=null;playbackMode='not started';if(ctx){try{await ctx.close();}catch(e){}ctx=null;}resetPlayback();ui();log('Speaker stopped');}
 function onMicAudio(ev){
   if(!micOn)return;
   const arr=ev.inputBuffer.getChannelData(0);
@@ -196,7 +260,11 @@ $('stopMic').addEventListener('click',()=>{stopMic();log('Mic stopped.');});
 $('copy').addEventListener('click',async()=>{try{await navigator.clipboard.writeText($('log').textContent);log('Log copied');}catch(e){err(e);}});
 $('clear').addEventListener('click',()=>{$('log').textContent='';});
 window.addEventListener('pagehide',()=>{stopMic();});
-log('Bluefy v1.4: paced BLE mic / smoothing. Measure losses before calls. No cloud audio relay.');ui();
+log('Bluefy v1.5: continuous audio playback + jitter buffer; no Wi-Fi audio.');ui();
+// Log automatic quality snapshots; users no longer need to manually transcribe counters.
+audioHealthTimer=setInterval(()=>{if(!connected)return;
+  log(`HEALTH rx=${rx} missing=${rxSequenceGaps} underruns=${rxUnderruns} speakerOverflow=${rxOverflow} sent=${tx} dropped=${micDropped} micQ=${micQueue.length} bufferMs=${$('speakerBuffer').textContent} host=[${lastHostStats}]`);
+},5000);
 </script>
 </body>
 </html>
