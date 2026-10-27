@@ -13,7 +13,7 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
 </head>
 <body>
 <h1>📱 F11 ⇄ iPhone</h1>
-<div class="sub">Bluetooth Direct • Bluefy • v1.6 — IMA ADPCM 4-bit / 25–33 packets/s</div>
+<div class="sub">Bluetooth Direct • Bluefy • v1.5 — Continuous Audio Engine</div>
 <div class="panel">
  <div class="status"><span class="dot" id="dot"></span><span id="state">غير متصل</span></div>
  <p>على الـOPPO افتح <b>F11 Bluetooth Host</b> واضغط <b>Start Bluetooth Host</b>. لازم يظهر <b>BLE advertising active</b>.</p>
@@ -37,7 +37,7 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
  <div class="stat"><span>Speaker overflows</span><strong id="speakerOverflow">0</strong></div>
  <div class="stat"><span>Playback engine</span><strong id="playbackMode">—</strong></div>
  <div class="stat"><span>Android BLE statistics</span><strong id="hostStats">—</strong></div>
- <div class="stat"><span>Bluetooth frame duration</span><strong id="frameMs">waiting for ADPCM config</strong></div>
+ <div class="stat"><span>Bluetooth frame duration</span><strong id="frameMs">10ms (waiting for config)</strong></div>
 </div>
 <div class="panel">
  <h2>تجربة الصوت — iPhone → OPPO</h2>
@@ -51,10 +51,19 @@ button{min-height:46px;padding:11px 9px;background:#3680ff;border:0;border-radiu
  <div class="stat"><span>Bluetooth audio packets sent</span><strong id="sent">0</strong></div>
  <div class="stat"><span>Mic packets queued</span><strong id="micQueued">0</strong></div>
 </div>
-<p class="note">v1.6 اختبر الصوت العادي بين الجهازين أولًا بدون Cellular Bridge أو Frida. الميكروفون والسماعة على الجهازين متباعدين لمنع الصفير. صوت Bluetooth مباشر بلا وسيط Wi-Fi. ما تستخدموش في مكالمات خاصة، وخلي Bluefy وAndroid Host في الواجهة.</p>
+<p class="note">v1.5 اختبر الصوت العادي بين الجهازين أولًا بدون Cellular Bridge أو Frida. الميكروفون والسماعة على الجهازين متباعدين لمنع الصفير. صوت Bluetooth مباشر بلا وسيط Wi-Fi. ما تستخدموش في مكالمات خاصة، وخلي Bluefy وAndroid Host في الواجهة.</p>
 <div class="panel"><h2>Log</h2><pre id="log" aria-live="polite"></pre><div class="row"><button id="copy" class="alt">Copy Log</button><button id="clear" class="alt">Clear Log</button></div></div>
 <script>
 'use strict';
+// Local diagnostics only; no additional BLE messages or changes to pacing.
+const diag={start:performance.now(),counts:{},metrics:{}};
+function dc(k,n=1){diag.counts[k]=(diag.counts[k]||0)+n;}
+function dm(k,v){const m=diag.metrics[k]||(diag.metrics[k]=[0,0,0]);m[0]++;m[1]+=v;m[2]=Math.max(m[2],v);}
+let captureAt=0,tickAt=0;const frameTimes=new WeakMap();
+function diagnosticSummary(){const now=performance.now(),seconds=(now-diag.start)/1000;
+ const metrics=Object.fromEntries(Object.entries(diag.metrics).map(([k,m])=>[k,{n:m[0],mean:+(m[1]/m[0]).toFixed(2),max:+m[2].toFixed(2)}]));
+ log('TXDIAG '+JSON.stringify({seconds:+seconds.toFixed(2),active:micOn,queue:micQueue.length,oldestMs:micQueue.length?+(now-frameTimes.get(micQueue[0])).toFixed(2):0,resolvedPerSec:+((diag.counts.resolved||0)/seconds).toFixed(2),counts:diag.counts,metrics}));diag.start=now;diag.counts={};diag.metrics={};}
+
 const U={service:'d4f00001-7e12-4b98-a1ae-f11c00000001',control:'d4f00002-7e12-4b98-a1ae-f11c00000001',status:'d4f00003-7e12-4b98-a1ae-f11c00000001',hostAudio:'d4f00004-7e12-4b98-a1ae-f11c00000001',clientAudio:'d4f00005-7e12-4b98-a1ae-f11c00000001'};
 const $=id=>document.getElementById(id);
 let device=null,chars={},connected=false,ctx=null,rx=0,tx=0,pingAt=0,pingToken='',seq=0;
@@ -62,12 +71,12 @@ let micStream=null,micSrc=null,micProcessor=null,micSilent=null,pcmPending=[],mi
 let micTimer=null, micSum=0, micCount=0, micPhase=0, micDisplayAt=0;
 let rxUnderruns=0, rxSilences=0, rxOverflow=0, playbackNode=null, playbackMode='not started', playbackBuffer=null;
 let audioHealthTimer=null, lastHostStats='—';
-let bleFrameSamples=0, codecReady=false, rxLastSeq=null, rxSequenceGaps=0, uiLast=0;
+let bleFrameSamples=80, rxLastSeq=null, rxSequenceGaps=0, uiLast=0;
 function updateAudioStats(){const now=performance.now();if(now-uiLast>250){uiLast=now;ui();}}
 function log(s){let x=$('log'); x.textContent+=`[${new Date().toLocaleTimeString()}] ${s}\n`;x.scrollTop=x.scrollHeight;}
 function ui(){['disconnect','hello','ping','speaker','startMic'].forEach(id=>$(id).disabled=!connected);$('connect').disabled=connected;$('clearAudio').disabled=!ctx;$('stopMic').disabled=!micOn;$('beepToOppo').disabled=!connected||beepBusy;$('startMic').disabled=!connected||beepBusy||micOn;$('dropCount').textContent=micDropped; $('micQueued').textContent=micQueue.length; $('rxUnderruns').textContent=rxUnderruns;$('speakerOverflow').textContent=rxOverflow;$('playbackMode').textContent=playbackMode;$('hostStats').textContent=lastHostStats;$('dot').classList.toggle('ok',connected);$('state').textContent=connected?'Bluetooth Connected':'غير متصل';$('recv').textContent=rx;$('sent').textContent=tx;const gapEl=$('rxGaps');if(gapEl)gapEl.textContent=rxSequenceGaps;}
 function err(e){log('ERROR '+(e?.name||'')+': '+(e?.message||String(e)));}
-function disconnected(){connected=false;codecReady=false;bleFrameSamples=0;chars={};stopMic();resetPlayback();$('device').textContent='اتقطع الاتصال';ui();log('Bluetooth disconnected');}
+function disconnected(){connected=false;chars={};stopMic();resetPlayback();$('device').textContent='اتقطع الاتصال';ui();log('Bluetooth disconnected');}
 async function connect(){try{if(!navigator.bluetooth){log('Web Bluetooth مش متاح هنا. افتح الصفحة في Bluefy، مش Safari.');return;}
 $('state').textContent='جاري البحث...';log('Searching for F11 service '+U.service);
 // Service-filtered chooser finds the OPPO regardless of advertised name.
@@ -85,53 +94,9 @@ await chars.hostAudio.startNotifications();
 connected=true;$('device').textContent=device.name||'F11 Bluetooth Host (unnamed)';log('Connected; subscribed STATUS + HOST_AUDIO');ui();await send('HELLO');await send('AUDIO_CONFIG');
 }catch(e){connected=false;ui();err(e);$('state').textContent='فشل الاتصال';}}
 async function send(s){if(!connected||!chars.control)return;try{const data=new TextEncoder().encode(s);if(chars.control.writeValueWithResponse)await chars.control.writeValueWithResponse(data);else await chars.control.writeValue(data);log('TX control: '+s);}catch(e){err(e);}}
-function onStatus(ev){let v=ev.target.value;const msg=new TextDecoder().decode(new Uint8Array(v.buffer,v.byteOffset,v.byteLength));$('reply').textContent=msg;log('RX control: '+msg);if(msg.startsWith('STATS:')){lastHostStats=msg.slice(6);updateAudioStats();return;}if(msg.startsWith('AUDIO_CODEC:')){const parts=msg.split(':');const n=Number(parts[2]);codecReady=parts[1]==='IMA4'&&(n===160||n===240||n===320);if(codecReady){bleFrameSamples=n;if(micOn)startMicTimer();$('frameMs').textContent='IMA ADPCM 4-bit / '+(n/8)+'ms';log('BLE ADPCM active: '+(n/8)+'ms, '+(4+n/2)+' byte packets');}else{bleFrameSamples=0;log('Unsupported codec '+msg+'; update Android Host to v1.6.');}}if(msg==='PONG:'+pingToken){$('rtt').textContent=(performance.now()-pingAt).toFixed(0)+' ms';}}
-// IMA ADPCM: loss-resilient independent 20/30/40ms frames, exactly matches Android ImaAdpcm.java.
-// Wire: [sequence, 16-bit predictor LE, initial step index, 4-bit nibbles low-first].
-const IMA_STEP=[
- 7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,
- 88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,
- 544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,
- 2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,
- 9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767];
-const IMA_INDEX=[-1,-1,-1,-1,2,4,6,8];
-const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
-function encodeIma(pcm,sequence){
-  if(pcm.length!==160&&pcm.length!==240&&pcm.length!==320)throw Error('ADPCM frame length invalid');
-  const pkt=new Uint8Array(4+pcm.length/2);pkt[0]=sequence&255;
-  let predictor=pcm[0]|0, idx=0;
-  const target=clamp(Math.abs((pcm[1]|0)-(pcm[0]|0))*2,7,32767);
-  let best=Infinity;for(let j=0;j<IMA_STEP.length;j++){const error=Math.abs(IMA_STEP[j]-target);if(error<best){best=error;idx=j;}}
-  pkt[1]=predictor&255;pkt[2]=(predictor>>>8)&255;pkt[3]=idx;
-  for(let i=0;i<pcm.length;i++){
-    let diff=(pcm[i]|0)-predictor,code=0;
-    if(diff<0){code=8;diff=-diff;}
-    const step=IMA_STEP[idx];let change=step>>3;
-    if(diff>=step){code|=4;diff-=step;change+=step;}
-    if(diff>=Math.floor(step/2)){code|=2;diff-=Math.floor(step/2);change+=step>>1;}
-    if(diff>=Math.floor(step/4)){code|=1;change+=step>>2;}
-    predictor=clamp(predictor+((code&8)?-change:change),-32768,32767);
-    idx=clamp(idx+IMA_INDEX[code&7],0,88);
-    const k=4+(i>>1);if((i&1)===0)pkt[k]=code;else pkt[k]|=code<<4;
-  }
-  return pkt;
-}
-function decodeIma(pkt){
-  const count=(pkt.length-4)*2;
-  if(count!==160&&count!==240&&count!==320)throw Error('Bad ADPCM packet length '+pkt.length);
-  let predictor=(pkt[1]|(pkt[2]<<8));if(predictor&32768)predictor-=65536;
-  let idx=pkt[3];if(idx>88)throw Error('ADPCM step index invalid');
-  const pcm=new Float32Array(count);
-  for(let i=0;i<count;i++){
-    const n=pkt[4+(i>>1)];const code=(i&1)?(n>>>4):(n&15);
-    const step=IMA_STEP[idx];let change=step>>3;
-    if(code&4)change+=step;if(code&2)change+=step>>1;if(code&1)change+=step>>2;
-    predictor=clamp(predictor+((code&8)?-change:change),-32768,32767);
-    idx=clamp(idx+IMA_INDEX[code&7],0,88);
-    pcm[i]=predictor/32768;
-  }
-  return pcm;
-}
+function onStatus(ev){let v=ev.target.value;const msg=new TextDecoder().decode(new Uint8Array(v.buffer,v.byteOffset,v.byteLength));$('reply').textContent=msg;log('RX control: '+msg);if(msg.startsWith('STATS:')){lastHostStats=msg.slice(6);updateAudioStats();return;}if(msg.startsWith('AUDIOFRAME:')){const n=Number(msg.slice(11));if(n===80||n===160){bleFrameSamples=n;if(micOn)startMicTimer();const frameEl=$('frameMs');if(frameEl)frameEl.textContent=(n/8)+'ms';log('BLE voice packet duration='+(n/8)+'ms');}}if(msg==='PONG:'+pingToken){$('rtt').textContent=(performance.now()-pingAt).toFixed(0)+' ms';}}
+function decode(b){const x=(~b)&255;const mag=((((x&15)<<3)+132)<<((x>>4)&7))-132;return ((x&128)?-mag:mag)/32768;}
+function encode(sample){let v=Math.max(-32768,Math.min(32767,Math.round(sample*32767)));const sign=v<0?128:0;if(v<0)v=-v;v=Math.min(v,32635)+132;let exponent=7,mask=0x4000;while(exponent>0&&(v&mask)===0){exponent--;mask>>=1;}const mantissa=(v>>(exponent+3))&15;return (~(sign|(exponent<<4)|mantissa))&255;}
 // A fixed-capacity ring buffer driven by the *audio clock*, not one AudioBufferSource per BLE packet.
 // Ring state is deliberately identical for AudioWorklet and the conservative Bluefy fallback.
 class F11JitterRing {
@@ -203,30 +168,31 @@ async function setupPlayback(){
 async function enableSpeaker(){try{await setupPlayback();log('iPhone speaker ready. Start OPPO audio.');}catch(e){err(e);}}
 function resetPlayback(){if(playbackMode==='AudioWorklet'&&playbackNode)playbackNode.port.postMessage({type:'reset'});
   if(fallbackJitter)fallbackJitter.reset();rxLastSeq=null;}
-function schedulePcmFrame(samples){if(!ctx||ctx.state!=='running'||!playbackNode)return;
+function schedulePcmFrame(bytes,offset,len){if(!ctx||ctx.state!=='running'||!playbackNode)return;
+  const samples=new Float32Array(len);if(bytes)for(let i=0;i<len;i++)samples[i]=decode(bytes[offset+i]);
   if(playbackMode==='AudioWorklet')playbackNode.port.postMessage({type:'push',samples},[samples.buffer]);
   else if(fallbackJitter)fallbackJitter.push(samples);
 }
 function onAudio(ev){
-  const v=ev.target.value;if(!v||v.byteLength<84||!codecReady)return;
-  const bytes=new Uint8Array(v.buffer,v.byteOffset,v.byteLength);
-  if(bytes.length!==4+bleFrameSamples/2){if(rx===0)log('Received incompatible audio packet; update OPPO Host to v1.6');return;}
+  const v=ev.target.value;if(!v||v.byteLength<2)return;
+  const bytes=new Uint8Array(v.buffer,v.byteOffset,v.byteLength);const len=bytes.length-1;
   rx++;
   const receivedSeq=bytes[0];let gap=0;
   if(rxLastSeq!==null){const diff=(receivedSeq-rxLastSeq+256)%256;
     if(diff>1&&diff<128){gap=diff-1;rxSequenceGaps+=gap;}}
   rxLastSeq=receivedSeq;updateAudioStats();
   if(!ctx||ctx.state!=='running'||!playbackNode)return;
-  try{for(let n=0;n<Math.min(gap,8);n++){schedulePcmFrame(new Float32Array(bleFrameSamples));rxSilences++;}
-    if(gap>8)resetPlayback();schedulePcmFrame(decodeIma(bytes));
+  try{for(let n=0;n<Math.min(gap,8);n++){schedulePcmFrame(null,0,len);rxSilences++;}
+    if(gap>8)resetPlayback();schedulePcmFrame(bytes,1,len);
   }catch(e){err(e);}
 }
 async function stopSpeaker(){stopMic();if(playbackNode){try{playbackNode.disconnect();}catch(e){}playbackNode=null;}fallbackJitter=null;playbackMode='not started';if(ctx){try{await ctx.close();}catch(e){}ctx=null;}resetPlayback();ui();log('Speaker stopped');}
 function onMicAudio(ev){
   if(!micOn)return;
-  const arr=ev.inputBuffer.getChannelData(0);
+  const now=performance.now();if(captureAt)dm("captureGapMs",now-captureAt);captureAt=now;dc("callbacks");
+  const arr=ev.inputBuffer.getChannelData(0);dc("inputSamples",arr.length);
   const native=ev.inputBuffer.sampleRate||ctx.sampleRate;
-  let sumsq=0;
+  dm("inputRateHz",native);let sumsq=0;
   for(let i=0;i<arr.length;i++){
     const sample=arr[i];sumsq+=sample*sample;
     // Average input samples before reducing 44.1/48kHz to 8kHz.
@@ -234,33 +200,35 @@ function onMicAudio(ev){
     micSum+=sample; micCount++;micPhase+=8000;
     if(micPhase>=native){
       micPhase-=native;
-      pcmPending.push(clamp(Math.round(32767*micSum/Math.max(1,micCount)),-32768,32767));
+      dc("resampledSamples");pcmPending.push(encode(micSum/Math.max(1,micCount)));
       micSum=0;micCount=0;
       if(pcmPending.length>=bleFrameSamples){
-        const samples=pcmPending.splice(0,bleFrameSamples);
-        const pkt=encodeIma(samples,seq++);
-        if(micQueue.length>=5){micQueue.shift();micDropped++;}
+        const pkt=new Uint8Array(bleFrameSamples+1);
+        pkt[0]=seq++&255;pkt.set(pcmPending.splice(0,bleFrameSamples),1);
+        dc("produced");frameTimes.set(pkt,performance.now());if(micQueue.length>=7){const old=micQueue.shift();dm("droppedAgeMs",performance.now()-frameTimes.get(old));dc("overflowDrops");micDropped++;}
         micQueue.push(pkt);
       }
     }
   }
   // The audio callback must stay lightweight; don't update the DOM 50x/sec.
   if(performance.now()-micDisplayAt>400){micDisplayAt=performance.now();$('micLevel').textContent=Math.sqrt(sumsq/Math.max(1,arr.length)).toFixed(4);updateAudioStats();}
+  dm('captureWorkMs',performance.now()-now);
 }
 function startMicTimer(){
   if(micTimer){clearInterval(micTimer);micTimer=null;}
   if(micOn)micTimer=setInterval(sendOneMicFrame,bleFrameSamples/8);
 }
 async function sendOneMicFrame(){
-  if(micBusy||!micOn||!connected||!codecReady||micQueue.length===0)return;
+  const tick=performance.now();if(tickAt)dm("tickGapMs",tick-tickAt);tickAt=tick;dc("ticks");if(micBusy)dc("busySkips");if(!micQueue.length)dc("emptyTicks");
+  if(micBusy||!micOn||!connected||micQueue.length===0)return;
   micBusy=true;
-  const frame=micQueue.shift();
+  const frame=micQueue.shift();const writeAt=performance.now();dm("queueAgeMs",writeAt-frameTimes.get(frame));dc("attempts");
   try{
     // Only one write per audio duration; no unbounded BLE bursts.
     if(chars.clientAudio.writeValueWithoutResponse)await chars.clientAudio.writeValueWithoutResponse(frame);
     else await chars.clientAudio.writeValue(frame);
-    tx++;updateAudioStats();
-  }catch(e){err(e);stopMic();}
+    dc("resolved");dm("writeMs",performance.now()-writeAt);tx++;updateAudioStats();
+  }catch(e){dc("writeErrors");err(e);stopMic();}
   finally{micBusy=false;}
 }
 
@@ -270,16 +238,14 @@ async function sendBeepToOppo(){
   let ok=0;
   log('OPPO-directed BLE tone; enable Play iPhone mic on OPPO first.');
   try{
-    if(!codecReady)throw Error('Waiting for AUDIO_CODEC:IMA4 configuration from Android Host');
     const count=bleFrameSamples, duration=count/8;
     for(let frame=0;frame*duration<1500&&connected;frame++){
-      const tone=new Int16Array(count);
+      const pkt=new Uint8Array(count+1);pkt[0]=seq++&255;
       for(let i=0;i<count;i++){
         const t=(frame*count+i)/8000;
         const on=(t>=0.15&&t<0.50)||(t>=0.78&&t<1.13);
-        tone[i]=Math.round((on?Math.sin(2*Math.PI*700*t)*0.32:0)*32767);
+        pkt[i+1]=encode(on?Math.sin(2*Math.PI*700*t)*0.32:0);
       }
-      const pkt=encodeIma(tone,seq++);
       if(chars.clientAudio.writeValueWithoutResponse)await chars.clientAudio.writeValueWithoutResponse(pkt);
       else await chars.clientAudio.writeValue(pkt);
       ok++;tx++;if(frame%8===0)ui();
@@ -289,11 +255,11 @@ async function sendBeepToOppo(){
   }catch(e){log('BLE beep FAILED after '+ok+' packets');err(e);}
   finally{beepBusy=false;ui();}
 }
-async function startMic(){if(!connected||beepBusy)return;if(!codecReady){log('WAITING for Android Host v1.6 codec confirmation.');return;}try{$('micState').textContent='Requesting microphone...';log('Microphone API available: '+Boolean(navigator.mediaDevices?.getUserMedia));if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){log('Bluefy version does not expose microphone getUserMedia; Ping and beep still work.');$('micState').textContent='ERROR: Bluefy has no getUserMedia support';return;}
+async function startMic(){if(!connected||beepBusy)return;try{$('micState').textContent='Requesting microphone...';log('Microphone API available: '+Boolean(navigator.mediaDevices?.getUserMedia));if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){log('Bluefy version does not expose microphone getUserMedia; Ping and beep still work.');$('micState').textContent='ERROR: Bluefy has no getUserMedia support';return;}
 await enableSpeaker();micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
-log('Microphone permission granted; track='+micStream.getAudioTracks().map(t=>t.readyState).join(','));await ctx.resume();micSrc=ctx.createMediaStreamSource(micStream);micProcessor=ctx.createScriptProcessor(1024,1,1);micSilent=ctx.createGain();micSilent.gain.value=0;micSrc.connect(micProcessor);micProcessor.connect(micSilent);micSilent.connect(ctx.destination);micOn=true;pcmPending=[];micQueue=[];micSum=0;micCount=0;micPhase=0;micProcessor.onaudioprocess=onMicAudio;startMicTimer();$('micState').textContent='Mic ON; speak now. Watch RMS and packets sent.';log('iPhone mic started; tap Play iPhone mic on OPPO.');ui();
+log('Microphone permission granted; track='+micStream.getAudioTracks().map(t=>t.readyState).join(','));await ctx.resume();micSrc=ctx.createMediaStreamSource(micStream);micProcessor=ctx.createScriptProcessor(1024,1,1);micSilent=ctx.createGain();micSilent.gain.value=0;micSrc.connect(micProcessor);micProcessor.connect(micSilent);micSilent.connect(ctx.destination);captureAt=0;tickAt=0;micOn=true;pcmPending=[];micQueue=[];micSum=0;micCount=0;micPhase=0;micProcessor.onaudioprocess=onMicAudio;startMicTimer();$('micState').textContent='Mic ON; speak now. Watch RMS and packets sent.';log('iPhone mic started; tap Play iPhone mic on OPPO.');ui();
 }catch(e){stopMic();$('micState').textContent='ERROR: '+(e?.name||'')+' '+(e?.message||'');err(e);}}
-function stopMic(){micOn=false;if(micTimer){clearInterval(micTimer);micTimer=null;}if($('micState'))$('micState').textContent='Mic OFF';if(micProcessor){micProcessor.onaudioprocess=null;micProcessor.disconnect();micProcessor=null;}if(micSrc){micSrc.disconnect();micSrc=null;}if(micSilent){micSilent.disconnect();micSilent=null;}if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}pcmPending=[];micQueue=[];ui();}
+function stopMic(){dc("stopDiscarded",micQueue.length);micOn=false;if(micTimer){clearInterval(micTimer);micTimer=null;}if($('micState'))$('micState').textContent='Mic OFF';if(micProcessor){micProcessor.onaudioprocess=null;micProcessor.disconnect();micProcessor=null;}if(micSrc){micSrc.disconnect();micSrc=null;}if(micSilent){micSilent.disconnect();micSilent=null;}if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}pcmPending=[];micQueue=[];ui();}
 $('connect').addEventListener('click',connect);
 $('disconnect').addEventListener('click',()=>{if(device?.gatt?.connected)device.gatt.disconnect();disconnected();});
 $('hello').addEventListener('click',()=>send('HELLO'));
@@ -306,11 +272,10 @@ $('stopMic').addEventListener('click',()=>{stopMic();log('Mic stopped.');});
 $('copy').addEventListener('click',async()=>{try{await navigator.clipboard.writeText($('log').textContent);log('Log copied');}catch(e){err(e);}});
 $('clear').addEventListener('click',()=>{$('log').textContent='';});
 window.addEventListener('pagehide',()=>{stopMic();});
-log('Bluefy v1.6: 4-bit IMA ADPCM and 25–33 BLE writes/sec. Update both sides. No Wi-Fi.');ui();
+log('Bluefy v1.5 diagnostics phase2: continuous audio playback + jitter buffer; no Wi-Fi audio.');ui();
 // Log automatic quality snapshots; users no longer need to manually transcribe counters.
 audioHealthTimer=setInterval(()=>{if(!connected)return;
-  const droppedPct=(tx+micDropped)>0?((100*micDropped/(tx+micDropped)).toFixed(1)+'%'):'0%';
-  log(`HEALTH rx=${rx} missing=${rxSequenceGaps} underruns=${rxUnderruns} speakerOverflow=${rxOverflow} sent=${tx} dropped=${micDropped} dropPct=${droppedPct} micQ=${micQueue.length} bufferMs=${$('speakerBuffer').textContent} host=[${lastHostStats}]`);
+  diagnosticSummary();log(`HEALTH rx=${rx} missing=${rxSequenceGaps} underruns=${rxUnderruns} speakerOverflow=${rxOverflow} sent=${tx} dropped=${micDropped} micQ=${micQueue.length} bufferMs=${$('speakerBuffer').textContent} host=[${lastHostStats}]`);
 },5000);
 </script>
 </body>
